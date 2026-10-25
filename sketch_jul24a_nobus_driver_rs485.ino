@@ -8,7 +8,7 @@
 const char* ssid = "DIGI-d7Ft";
 const char* password = "tame9tdvD9";
 
-const char* mqtt_server = "192.168.1.1"; // IP-ul serverului Ubuntu
+const char* mqtt_server = "192.168.1.1";
 const int mqtt_port = 1883;
 
 const char* TOPIC_RX = "esp/pompa/stare_raw";
@@ -27,7 +27,8 @@ PubSubClient mqttClient(espClient);
 
 unsigned long lastHeartbeat = 0;
 unsigned long lastPoll = 0;
-unsigned long lastWiFiCheck = 0; // Temporizator pentru reconectare WiFi
+unsigned long lastWiFiCheck = 0; 
+unsigned long lastMqttCheck = 0; // [FIX] Temporizator pentru reconectare MQTT
 
 // ==========================================
 // 3. FUNCȚIE CALCUL CRC16
@@ -71,6 +72,7 @@ bool modbusWriteSingleRegister(uint16_t reg, uint16_t val) {
   unsigned long startTime = millis();
   while (Serial1.available() < 8) {
     if (millis() - startTime > 300) return false;
+    delay(1); // [FIX] Permite rularea proceselor WiFi in background
   }
 
   uint8_t response[8];
@@ -102,6 +104,7 @@ bool modbusReadHoldingRegisters(uint16_t startReg, uint16_t count, uint16_t *out
   unsigned long startTime = millis();
   while (Serial1.available() < expectedBytes) {
     if (millis() - startTime > 300) return false;
+    delay(1); // [FIX] Evita trigger WDT
   }
 
   uint8_t response[128];
@@ -136,6 +139,7 @@ bool modbusReadInputRegisters(uint16_t startReg, uint16_t count, uint16_t *outVa
   unsigned long startTime = millis();
   while (Serial1.available() < expectedBytes) {
     if (millis() - startTime > 400) return false; 
+    delay(1); // [FIX] Stabilizeaza stiva TCP/IP
   }
 
   uint8_t response[128];
@@ -153,11 +157,16 @@ bool modbusReadInputRegisters(uint16_t startReg, uint16_t count, uint16_t *outVa
 // 5. CALLBACK MQTT & NETWORK MANAGEMENT
 // ==========================================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String msg;
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-
+  // [FIX] FARA STRING-URI AICI. Parsam direct array-ul de octeti. 
+  // Astfel eliminam complet fragmentarea de Heap.
   JsonDocument doc;
-  if (deserializeJson(doc, msg)) return;
+  DeserializationError error = deserializeJson(doc, payload, length);
+  
+  if (error) {
+    Serial.print("Eroare parsare JSON: ");
+    Serial.println(error.c_str());
+    return;
+  }
 
   if (doc.containsKey("reg") && doc.containsKey("val")) {
     uint16_t registru = doc["reg"];
@@ -168,25 +177,29 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 }
 
 void checkWiFiAndMQTT() {
+  unsigned long currentMillis = millis();
+
   // 1. Verificare WiFi Non-Blocantă
   if (WiFi.status() != WL_CONNECTED) {
-    unsigned long currentMillis = millis();
-    // Incercam reconectarea la fiecare 10 secunde, ca sa nu blocam Modbus-ul
     if (currentMillis - lastWiFiCheck >= 10000) {
       Serial.println("🔗 [WIFI] Conexiune pierduta. Se reincearca...");
       WiFi.disconnect();
       WiFi.begin(ssid, password);
       lastWiFiCheck = currentMillis;
     }
-    return; // Daca nu avem WiFi, nu are sens sa incercam MQTT
+    return; 
   }
 
   // 2. Verificare MQTT Non-Blocantă
   if (!mqttClient.connected()) {
-    Serial.println("🔗 [MQTT] Conectare la Mosquitto...");
-    if (mqttClient.connect("Esp32_DriverModbus")) {
-      Serial.println("✅ [MQTT] Conectat cu succes!");
-      mqttClient.subscribe(TOPIC_TX);
+    // [FIX] Reconectare MQTT protejata temporal, ca sa nu blocheze Modbus-ul si Loop-ul
+    if (currentMillis - lastMqttCheck >= 5000) {
+      Serial.println("🔗 [MQTT] Conectare la Mosquitto...");
+      if (mqttClient.connect("Esp32_DriverModbus")) {
+        Serial.println("✅ [MQTT] Conectat cu succes!");
+        mqttClient.subscribe(TOPIC_TX);
+      }
+      lastMqttCheck = currentMillis;
     }
   }
 }
@@ -207,6 +220,9 @@ void setup() {
 
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
+  
+  // [FIX] MARIRE BUFFER MQTT. Implicit este 256. Payload-ul tau din loop poate depasi asta.
+  mqttClient.setBufferSize(1024); 
 
   Serial1.begin(BAUD_RATE, SERIAL_8N1, RX_PIN, TX_PIN);
   Serial.println("✅ [DRIVER INIT] Modbus activat. Let's go!");
@@ -216,8 +232,8 @@ void setup() {
 // 7. BUCLA PRINCIPALĂ
 // ==========================================
 void loop() {
-  // Gestionare conexiuni retea in mod sigur (fara while-uri blocate)
   checkWiFiAndMQTT();
+  
   if (mqttClient.connected()) {
     mqttClient.loop();
   }
@@ -242,7 +258,6 @@ void loop() {
     JsonDocument rxDoc;
     bool celPutinUnBlocCitit = false;
 
-    // Bloc 2000 (Holding)
     if (modbusReadHoldingRegisters(2000, 5, buffer)) {
       rxDoc["2000"] = buffer[0];
       rxDoc["2001"] = buffer[1];
@@ -251,7 +266,6 @@ void loop() {
     }
     delay(20);
 
-    // Bloc 1000 (Input)
     if (modbusReadInputRegisters(1000, 4, buffer)) {
       rxDoc["1001"] = buffer[1];
       rxDoc["1003"] = buffer[3];
@@ -259,16 +273,15 @@ void loop() {
     }
     delay(20);
 
-    // Bloc 300 (Input)
-    if (modbusReadInputRegisters(300, 6, buffer)) {
+    if (modbusReadInputRegisters(300, 37, buffer)) {
       rxDoc["302"] = buffer[2];
       rxDoc["304"] = buffer[4];
       rxDoc["305"] = buffer[5];
+      rxDoc["336"] = buffer[36]; // Presiune instalatie (val / 10.0 bar)
       celPutinUnBlocCitit = true;
     }
     delay(20);
 
-    // Bloc 8000 (Input - 46 Regiștri)
     if (modbusReadInputRegisters(8000, 46, buffer)) {
       rxDoc["8000"] = buffer[0];
       rxDoc["8001"] = buffer[1];
@@ -277,7 +290,6 @@ void loop() {
       celPutinUnBlocCitit = true;
     }
 
-    // Publicare date
     if (celPutinUnBlocCitit && mqttClient.connected()) {
       String outputPayload;
       serializeJson(rxDoc, outputPayload);
